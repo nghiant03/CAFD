@@ -17,7 +17,7 @@ data:
     train_stride: 10
     test_stride: 60
   split:
-    strategy: connectivity_aware_chronological
+    strategy: connectivity-chronological
     train_ratio: 0.8
     val_ratio: 0.1
     test_ratio: 0.1
