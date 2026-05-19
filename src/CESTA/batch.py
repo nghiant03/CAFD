@@ -14,3 +14,10 @@ class GraphWindowBatch:
     node_mask: torch.Tensor
     edge_index: torch.Tensor
     edge_mask: torch.Tensor
+
+
+@dataclass
+class TemporalWindowBatch:
+    x: torch.Tensor
+    y: torch.Tensor
+    node_ids: torch.Tensor | None = None

@@ -16,13 +16,13 @@ import torch.nn as nn
 from numpy.typing import NDArray
 from torch.utils.data import DataLoader, TensorDataset
 
-from CESTA.batch import GraphWindowBatch
+from CESTA.batch import GraphWindowBatch, TemporalWindowBatch
 from CESTA.datasets.injected.graph import GraphMetadata
 from CESTA.logging import logger
 from CESTA.models.base import BaseModel
 from CESTA.schema import EvaluateConfig
 from CESTA.schema.fault import FaultType
-from CESTA.training.graph_batch import GraphWindowDataset, collate_graph_batch
+from CESTA.training.graph_batch import GraphWindowDataset, TemporalWindowDataset, collate_graph_batch, collate_temporal_batch
 
 from .communication import aggregate_communication_stats
 from .metrics import ClassMetrics, compute_class_metrics, confusion_matrix, macro_f1
@@ -335,6 +335,14 @@ class Evaluator:
                 shuffle=False,
                 collate_fn=collate_graph_batch,
             )
+        if isinstance(node_identity := (metadata or {}).get("node_identity"), dict):
+            dataset = TemporalWindowDataset(X, y, node_identity.get("test_node_ids"))
+            return DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=False,
+                collate_fn=collate_temporal_batch,
+            )
         X_t = torch.tensor(X, dtype=torch.float32)
         y_t = torch.tensor(y, dtype=torch.long)
         dataset = TensorDataset(X_t, y_t)
@@ -356,12 +364,19 @@ class Evaluator:
                 edge_mask=torch.ones(1, X.shape[1], graph_meta.edge_index.shape[1], dtype=torch.bool, device=self.device),
             )
             return int(model(sample).size(-1))
+        if isinstance((metadata or {}).get("node_identity"), dict):
+            sample = TemporalWindowBatch(
+                x=torch.zeros(1, X.shape[1], X.shape[2], device=self.device),
+                y=torch.zeros(1, X.shape[1], dtype=torch.long, device=self.device),
+                node_ids=torch.zeros(1, dtype=torch.long, device=self.device),
+            )
+            return int(model(sample).size(-1))
         return int(model(torch.zeros(1, X.shape[1], X.shape[2], device=self.device)).size(-1))
 
     def _prepare_batch(
         self,
         batch: object,
-    ) -> tuple[torch.Tensor | GraphWindowBatch, torch.Tensor, torch.Tensor | None, int]:
+    ) -> tuple[torch.Tensor | GraphWindowBatch | TemporalWindowBatch, torch.Tensor, torch.Tensor | None, int]:
         if isinstance(batch, GraphWindowBatch):
             graph_batch = GraphWindowBatch(
                 x=batch.x.to(self.device),
@@ -371,8 +386,15 @@ class Evaluator:
                 edge_mask=batch.edge_mask.to(self.device),
             )
             return graph_batch, graph_batch.y, graph_batch.node_mask, graph_batch.x.size(0)
+        if isinstance(batch, TemporalWindowBatch):
+            temporal_batch = TemporalWindowBatch(
+                x=batch.x.to(self.device),
+                y=batch.y.to(self.device),
+                node_ids=batch.node_ids.to(self.device) if batch.node_ids is not None else None,
+            )
+            return temporal_batch, temporal_batch.y, None, temporal_batch.x.size(0)
         if not isinstance(batch, (tuple, list)) or len(batch) != 2:
-            raise TypeError("Expected a tensor batch or GraphWindowBatch")
+            raise TypeError("Expected a tensor batch, TemporalWindowBatch, or GraphWindowBatch")
         X_batch = batch[0].to(self.device)
         y_batch = batch[1].to(self.device)
         return X_batch, y_batch, None, X_batch.size(0)

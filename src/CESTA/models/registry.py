@@ -88,7 +88,11 @@ def create_model(
     model_cls = get_model_class(name)
     metadata = metadata or {}
 
-    missing = model_cls.required_metadata - set(metadata.keys())
+    required_metadata = model_cls.required_metadata
+    optional_metadata = model_cls.optional_metadata & set(metadata.keys())
+    usable_metadata = required_metadata | optional_metadata
+
+    missing = required_metadata - set(metadata.keys())
     if missing:
         raise ValueError(
             f"Model '{name}' requires metadata keys {sorted(missing)}. "
@@ -101,7 +105,7 @@ def create_model(
         **kwargs,
     }
 
-    model_kwargs.update(_extract_metadata_kwargs(metadata, model_cls.required_metadata))
+    model_kwargs.update(_extract_metadata_kwargs(metadata, usable_metadata))
 
     return model_cls(**model_kwargs)
 
@@ -115,21 +119,23 @@ def _extract_metadata_kwargs(
     """
     kwargs: dict[str, object] = {}
 
-    if "graph" not in required:
-        return kwargs
+    if "graph" in required:
+        from CESTA.datasets.injected.graph import GraphMetadata
 
-    from CESTA.datasets.injected.graph import GraphMetadata
+        graph_meta = metadata.get("graph")
+        if isinstance(graph_meta, GraphMetadata):
+            if graph_meta.adjacency is None:
+                raise ValueError("Graph metadata is missing adjacency")
+            edge_prob = graph_meta.adjacency.copy()
+            if graph_meta.edge_index.shape[1] > 0:
+                edge_prob[graph_meta.edge_index[0], graph_meta.edge_index[1]] = graph_meta.edge_prob
+            kwargs["num_nodes"] = graph_meta.num_nodes
+            kwargs["adjacency"] = graph_meta.adjacency.tolist()
+            kwargs["edge_prob"] = edge_prob.tolist()
 
-    graph_meta = metadata.get("graph")
-    if isinstance(graph_meta, GraphMetadata):
-        if graph_meta.adjacency is None:
-            raise ValueError("Graph metadata is missing adjacency")
-        edge_prob = graph_meta.adjacency.copy()
-        if graph_meta.edge_index.shape[1] > 0:
-            edge_prob[graph_meta.edge_index[0], graph_meta.edge_index[1]] = graph_meta.edge_prob
-        kwargs["num_nodes"] = graph_meta.num_nodes
-        kwargs["adjacency"] = graph_meta.adjacency.tolist()
-        kwargs["edge_prob"] = edge_prob.tolist()
+    node_identity = metadata.get("node_identity")
+    if "node_identity" in required and isinstance(node_identity, dict):
+        kwargs["num_nodes"] = int(node_identity["num_nodes"])
 
     return kwargs
 

@@ -31,6 +31,7 @@ class BaseModel(nn.Module, ABC):
     """
 
     required_metadata: ClassVar[set[str]] = set()
+    optional_metadata: ClassVar[set[str]] = set()
 
     @property
     @abstractmethod

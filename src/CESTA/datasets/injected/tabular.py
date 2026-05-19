@@ -174,6 +174,7 @@ class InjectedDataset:
         split_config: DataSplitConfig | None = None,
         features: list[str] | None = None,
         required_metadata: set[str] | None = None,
+        split_bounds: tuple[int, int, int, int] | None = None,
     ) -> WindowedSplits:
         """Convert this dataset into windowed train/val/test arrays.
 
@@ -205,6 +206,9 @@ class InjectedDataset:
         if split.strategy != "chronological":
             msg = f"InjectedDataset supports only chronological split strategy, got {split.strategy!r}"
             raise ValueError(msg)
+        if split_bounds is not None and self.group_column in self.df.columns:
+            msg = "Global split bounds are only supported for a single time-aligned tabular block"
+            raise ValueError(msg)
         selected_features = validate_features(features, self.feature_names)
         group_col = self.group_column
 
@@ -222,7 +226,7 @@ class InjectedDataset:
             group_labels = group_df["fault_state"].to_numpy(dtype=np.int32)
 
             X_tr, y_tr, X_va, y_va, X_te, y_te = split_and_window(
-                group_features, group_labels, wc, split
+                group_features, group_labels, wc, split, split_bounds=split_bounds
             )
 
             if len(X_tr) > 0:
@@ -242,7 +246,7 @@ class InjectedDataset:
             test_X_parts, test_y_parts,
         )
 
-        return WindowedSplits(
+        windowed = WindowedSplits(
             X_train=X_train,
             y_train=y_train,
             X_val=X_val,
@@ -250,6 +254,14 @@ class InjectedDataset:
             X_test=X_test,
             y_test=y_test,
         )
+        if split_bounds is not None:
+            train_start, train_end, val_end, test_end = split_bounds
+            windowed.split_bounds = {
+                "train": (train_start, train_end),
+                "val": (train_end, val_end),
+                "test": (val_end, test_end),
+            }
+        return windowed
 
     def get_class_weights(self) -> dict[int, float]:
         """Compute inverse frequency class weights for imbalanced learning.

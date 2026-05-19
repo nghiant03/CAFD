@@ -41,6 +41,7 @@ class WindowedSplits:
     X_test: NDArray[np.float32]
     y_test: NDArray[np.int32]
     metadata: dict[str, Any] = field(default_factory=dict)
+    split_bounds: dict[str, tuple[int, int]] = field(default_factory=dict)
     node_mask_train: NDArray[np.bool_] | None = None
     node_mask_val: NDArray[np.bool_] | None = None
     node_mask_test: NDArray[np.bool_] | None = None
@@ -119,6 +120,7 @@ def split_and_window(
     labels: NDArray[np.int32],
     wc: WindowConfig,
     split: DataSplitConfig,
+    split_bounds: tuple[int, int, int, int] | None = None,
 ) -> tuple[
     NDArray[np.float32],
     NDArray[np.int32],
@@ -128,11 +130,16 @@ def split_and_window(
     NDArray[np.int32],
 ]:
     """Chronologically split a single contiguous block and create windows."""
-    train_end, val_end = split_boundaries(len(features), split)
+    if split_bounds is None:
+        train_start = 0
+        train_end, val_end = split_boundaries(len(features), split)
+        test_end = len(features)
+    else:
+        train_start, train_end, val_end, test_end = split_bounds
 
-    X_tr, y_tr = create_windows(features[:train_end], labels[:train_end], wc.window_size, wc.train_stride)
+    X_tr, y_tr = create_windows(features[train_start:train_end], labels[train_start:train_end], wc.window_size, wc.train_stride)
     X_va, y_va = create_windows(features[train_end:val_end], labels[train_end:val_end], wc.window_size, wc.test_stride)
-    X_te, y_te = create_windows(features[val_end:], labels[val_end:], wc.window_size, wc.test_stride)
+    X_te, y_te = create_windows(features[val_end:test_end], labels[val_end:test_end], wc.window_size, wc.test_stride)
 
     return X_tr, y_tr, X_va, y_va, X_te, y_te
 

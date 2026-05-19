@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 from CESTA.datasets.injected.tabular import InjectedDataset
 from CESTA.datasets.injected.windowed import (
     WindowedSplits,
+    collect_splits,
     create_windows_with_starts,
     split_boundaries,
     validate_features,
@@ -315,8 +316,16 @@ class GraphDataset(InjectedDataset):
         split_config: DataSplitConfig | None = None,
         features: list[str] | None = None,
         required_metadata: set[str] | None = None,
+        split_bounds: tuple[int, int, int, int] | None = None,
     ) -> WindowedSplits:
         if required_metadata is not None and "graph" not in required_metadata:
+            if split_config is not None and split_config.strategy == "connectivity-chronological":
+                return self._prepare_aligned_tabular(
+                    window_config=window_config,
+                    split_config=split_config,
+                    features=features,
+                    required_metadata=required_metadata,
+                )
             return InjectedDataset.prepare(
                 self,
                 window_config=window_config,
@@ -386,12 +395,134 @@ class GraphDataset(InjectedDataset):
             X_test=X_test,
             y_test=y_test,
             metadata={"graph": metadata},
+            split_bounds={
+                "train": (train_start, train_end),
+                "val": (train_end, val_end),
+                "test": (val_end, test_end),
+            },
             node_mask_train=self._window_by_starts(node_mask, train_starts, wc.window_size),
             node_mask_val=self._window_by_starts(node_mask, val_starts, wc.window_size),
             node_mask_test=self._window_by_starts(node_mask, test_starts, wc.window_size),
             edge_mask_train=self._window_by_starts(edge_mask_all, train_starts, wc.window_size),
             edge_mask_val=self._window_by_starts(edge_mask_all, val_starts, wc.window_size),
             edge_mask_test=self._window_by_starts(edge_mask_all, test_starts, wc.window_size),
+        )
+
+    def _prepare_aligned_tabular(
+        self,
+        window_config: WindowConfig | None = None,
+        split_config: DataSplitConfig | None = None,
+        features: list[str] | None = None,
+        required_metadata: set[str] | None = None,
+    ) -> WindowedSplits:
+        wc = window_config if window_config is not None else WindowConfig()
+        split = split_config if split_config is not None else DataSplitConfig(strategy="connectivity-chronological")
+        selected_features = validate_features(features, self.feature_names)
+        df = self.df
+        group_col = self.group_column
+        node_ids = self.node_ids
+        timestamps = sorted(df["timestamp"].unique())
+        ts_index = {ts: i for i, ts in enumerate(timestamps)}
+        T = len(timestamps)
+        N = len(node_ids)
+        F = len(selected_features)
+
+        feature_blocks = np.zeros((N, T, F), dtype=np.float32)
+        label_blocks = np.full((N, T), -1, dtype=np.int32)
+        node_mask = np.zeros((T, N), dtype=np.bool_)
+        node_index = {nid: i for i, nid in enumerate(node_ids)}
+
+        for row in df[["timestamp", group_col, "fault_state", *selected_features]].itertuples(index=False):
+            t = ts_index[getattr(row, "timestamp")]
+            n = node_index[int(getattr(row, group_col))]
+            for feature_idx, feature_name in enumerate(selected_features):
+                feature_blocks[n, t, feature_idx] = np.float32(getattr(row, feature_name))
+            label_blocks[n, t] = np.int32(getattr(row, "fault_state"))
+            node_mask[t, n] = True
+
+        edge_mask_all = self._available_edge_mask(node_mask)
+        train_start, train_end, val_end, test_end = self._split_boundaries(T, edge_mask_all, wc, split)
+
+        train_X_parts: list[NDArray[np.float32]] = []
+        train_y_parts: list[NDArray[np.int32]] = []
+        val_X_parts: list[NDArray[np.float32]] = []
+        val_y_parts: list[NDArray[np.int32]] = []
+        test_X_parts: list[NDArray[np.float32]] = []
+        test_y_parts: list[NDArray[np.int32]] = []
+
+        train_node_parts: list[NDArray[np.int64]] = []
+        val_node_parts: list[NDArray[np.int64]] = []
+        test_node_parts: list[NDArray[np.int64]] = []
+
+        for node_pos in range(N):
+            valid = node_mask[:, node_pos]
+            X_tr, y_tr, tr_starts = create_windows_with_starts(
+                feature_blocks[node_pos, train_start:train_end], label_blocks[node_pos, train_start:train_end], wc.window_size, wc.train_stride
+            )
+            tr_starts = tr_starts + train_start
+            tr_keep = self._valid_window_starts(valid, tr_starts, wc.window_size)
+            X_tr = X_tr[tr_keep]
+            y_tr = y_tr[tr_keep]
+
+            X_va, y_va, va_starts = create_windows_with_starts(
+                feature_blocks[node_pos, train_end:val_end], label_blocks[node_pos, train_end:val_end], wc.window_size, wc.test_stride
+            )
+            va_starts = va_starts + train_end
+            va_keep = self._valid_window_starts(valid, va_starts, wc.window_size)
+            X_va = X_va[va_keep]
+            y_va = y_va[va_keep]
+
+            X_te, y_te, te_starts = create_windows_with_starts(
+                feature_blocks[node_pos, val_end:test_end], label_blocks[node_pos, val_end:test_end], wc.window_size, wc.test_stride
+            )
+            te_starts = te_starts + val_end
+            te_keep = self._valid_window_starts(valid, te_starts, wc.window_size)
+            X_te = X_te[te_keep]
+            y_te = y_te[te_keep]
+
+            if len(X_tr) > 0:
+                train_X_parts.append(X_tr)
+                train_y_parts.append(y_tr)
+                train_node_parts.append(np.full((len(X_tr),), node_pos, dtype=np.int64))
+            if len(X_va) > 0:
+                val_X_parts.append(X_va)
+                val_y_parts.append(y_va)
+                val_node_parts.append(np.full((len(X_va),), node_pos, dtype=np.int64))
+            if len(X_te) > 0:
+                test_X_parts.append(X_te)
+                test_y_parts.append(y_te)
+                test_node_parts.append(np.full((len(X_te),), node_pos, dtype=np.int64))
+
+        X_train, y_train, X_val, y_val, X_test, y_test = collect_splits(
+            wc, F,
+            train_X_parts, train_y_parts,
+            val_X_parts, val_y_parts,
+            test_X_parts, test_y_parts,
+        )
+
+        metadata: dict[str, Any] = {}
+        if required_metadata is not None and "node_identity" in required_metadata:
+            metadata["node_identity"] = {
+                "num_nodes": N,
+                "train_node_ids": np.concatenate(train_node_parts) if train_node_parts else np.empty((0,), dtype=np.int64),
+                "val_node_ids": np.concatenate(val_node_parts) if val_node_parts else np.empty((0,), dtype=np.int64),
+                "test_node_ids": np.concatenate(test_node_parts) if test_node_parts else np.empty((0,), dtype=np.int64),
+                "node_ids": list(node_ids),
+            }
+
+        return WindowedSplits(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            X_test=X_test,
+            y_test=y_test,
+            metadata=metadata,
+            split_bounds={
+                "train": (train_start, train_end),
+                "val": (train_end, val_end),
+                "test": (val_end, test_end),
+            },
         )
 
     def _available_edge_mask(self, node_mask: NDArray[np.bool_]) -> NDArray[np.bool_]:
@@ -461,6 +592,16 @@ class GraphDataset(InjectedDataset):
             return False
         starts = range(start, end - window_size + 1, stride)
         return any(bool(edge_mask[i : i + window_size].any()) for i in starts)
+
+    @staticmethod
+    def _valid_window_starts(
+        valid: NDArray[np.bool_],
+        starts: NDArray[np.int64],
+        window_size: int,
+    ) -> NDArray[np.bool_]:
+        if len(starts) == 0:
+            return np.empty((0,), dtype=np.bool_)
+        return np.asarray([bool(valid[i : i + window_size].all()) for i in starts], dtype=np.bool_)
 
     @staticmethod
     def _window_by_starts(

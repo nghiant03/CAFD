@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import ClassVar, Literal, TypedDict, cast
 
@@ -52,6 +53,8 @@ class CESTAClassifier(BaseModel):
         gumbel_temperature: float = 1.0,
         gate_hidden_size: int = 32,
         num_attention_heads: int = 1,
+        graph_residual_init: float = 1.0,
+        bidirectional: bool = False,
     ) -> None:
         super().__init__()
         if input_size % num_nodes != 0:
@@ -66,6 +69,8 @@ class CESTAClassifier(BaseModel):
             raise ValueError("gate_hidden_size must be positive")
         if num_attention_heads < 1:
             raise ValueError("num_attention_heads must be positive")
+        if not 0.0 <= graph_residual_init <= 1.0:
+            raise ValueError("graph_residual_init must be in [0, 1]")
 
         self.input_size = input_size
         self.num_nodes = num_nodes
@@ -80,6 +85,9 @@ class CESTAClassifier(BaseModel):
         self.gumbel_temperature = gumbel_temperature
         self.gate_hidden_size = gate_hidden_size
         self.num_attention_heads = num_attention_heads
+        self.graph_residual_init = graph_residual_init
+        self.bidirectional = bidirectional
+        self.encoder_output_size = hidden_size * (2 if bidirectional else 1)
 
         self._gate_entropy: torch.Tensor | None = None
 
@@ -87,8 +95,8 @@ class CESTAClassifier(BaseModel):
             raise NotImplementedError(
                 "Multi-head attention (>1) is not yet implemented"
             )
-        if hidden_size % num_attention_heads != 0:
-            raise ValueError("hidden_size must be divisible by num_attention_heads")
+        if self.encoder_output_size % num_attention_heads != 0:
+            raise ValueError("encoder output size must be divisible by num_attention_heads")
 
         if adjacency is not None:
             adj_tensor = torch.tensor(adjacency, dtype=torch.float32)
@@ -114,25 +122,32 @@ class CESTAClassifier(BaseModel):
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
         )
         self.dropout = nn.Dropout(dropout)
-        self.attention_scale = hidden_size ** 0.5
-        self.W_q = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.W_k = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.W_v = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.attention_scale = self.encoder_output_size ** 0.5
+        self.W_q = nn.Linear(self.encoder_output_size, self.encoder_output_size, bias=False)
+        self.W_k = nn.Linear(self.encoder_output_size, self.encoder_output_size, bias=False)
+        self.W_v = nn.Linear(self.encoder_output_size, self.encoder_output_size, bias=False)
+        fusion_output_size = fusion_hidden_size or self.encoder_output_size
         self.fusion = nn.Sequential(
-            nn.Linear(hidden_size * 2, fusion_hidden_size or hidden_size),
+            nn.Linear(self.encoder_output_size * 2, fusion_output_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(fusion_hidden_size or hidden_size, hidden_size),
+            nn.Linear(fusion_output_size, self.encoder_output_size),
+        )
+        residual_eps = 1e-4
+        residual_init = min(max(graph_residual_init, residual_eps), 1.0 - residual_eps)
+        self.graph_residual_logit = nn.Parameter(
+            torch.tensor(math.log(residual_init / (1.0 - residual_init)), dtype=torch.float32)
         )
         self.request_gate = nn.Sequential(
-            nn.Linear(hidden_size + 3, gate_hidden_size),
+            nn.Linear(self.encoder_output_size + 3, gate_hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(gate_hidden_size, 2),
         )
-        self.classifier = nn.Linear(hidden_size, num_classes)
+        self.classifier = nn.Linear(self.encoder_output_size, num_classes)
         self._last_communication_stats: CommunicationStats = (
             self._zero_communication_stats()
         )
@@ -155,6 +170,10 @@ class CESTAClassifier(BaseModel):
     @property
     def communication_loss(self) -> torch.Tensor | None:
         return self._communication_loss
+
+    @property
+    def graph_residual_scale(self) -> torch.Tensor:
+        return torch.sigmoid(self.graph_residual_logit)
 
     @property
     def gate_entropy(self) -> torch.Tensor | None:
@@ -186,7 +205,7 @@ class CESTAClassifier(BaseModel):
 
         local_hidden, _ = self.temporal_encoder(local_input)
         local_hidden = local_hidden.view(
-            batch, self.num_nodes, seq_len, self.hidden_size
+            batch, self.num_nodes, seq_len, self.encoder_output_size
         )
         local_hidden = local_hidden.permute(0, 2, 1, 3)
 
@@ -195,7 +214,7 @@ class CESTAClassifier(BaseModel):
                 local_hidden, edge_index=edge_index, edge_mask=edge_mask
             )
             fused = self.fusion(torch.cat([local_hidden, neighbor_context], dim=-1))
-            hidden = self.dropout(local_hidden + fused)
+            hidden = self.dropout(local_hidden + self.graph_residual_scale * fused)
             self._last_communication_stats = self._dense_communication_stats(
                 possible_mask=possible_mask,
                 batch=batch,
@@ -211,7 +230,7 @@ class CESTAClassifier(BaseModel):
                 )
             )
             fused = self.fusion(torch.cat([local_hidden, neighbor_context], dim=-1))
-            hidden = self.dropout(local_hidden + fused)
+            hidden = self.dropout(local_hidden + self.graph_residual_scale * fused)
             self._last_communication_stats = self._request_communication_stats(
                 request_mask=request_mask,
                 possible_mask=possible_mask,
@@ -380,7 +399,7 @@ class CESTAClassifier(BaseModel):
         else:
             possible_edges = possible_mask.sum()
         requested_edges = possible_edges
-        transmitted_bits = requested_edges * self.hidden_size * self.precision_bits
+        transmitted_bits = requested_edges * self.encoder_output_size * self.precision_bits
         return {
             "active_request_ratio": 1.0 if possible_edges.detach().cpu().item() > 0 else 0.0,
             "requested_edge_count": float(requested_edges.detach().cpu().item()),
@@ -399,7 +418,7 @@ class CESTAClassifier(BaseModel):
         possible_edges = possible_mask.sum()
         requested_edges = request_mask.sum()
         active_ratio = requested_edges / possible_edges.clamp_min(1.0)
-        transmitted_bits = requested_edges * self.hidden_size * self.precision_bits
+        transmitted_bits = requested_edges * self.encoder_output_size * self.precision_bits
         return {
             "active_request_ratio": float(active_ratio.detach().cpu().item()),
             "requested_edge_count": float(requested_edges.detach().cpu().item()),
@@ -460,6 +479,8 @@ class CESTAClassifier(BaseModel):
             "gumbel_temperature": self.gumbel_temperature,
             "gate_hidden_size": self.gate_hidden_size,
             "num_attention_heads": self.num_attention_heads,
+            "graph_residual_init": self.graph_residual_init,
+            "bidirectional": self.bidirectional,
         }
 
     @classmethod
@@ -487,6 +508,8 @@ class CESTAClassifier(BaseModel):
             gumbel_temperature=float(config.get("gumbel_temperature", 1.0)),
             gate_hidden_size=int(config.get("gate_hidden_size", 32)),
             num_attention_heads=int(config.get("num_attention_heads", 1)),
+            graph_residual_init=float(config.get("graph_residual_init", 1.0)),
+            bidirectional=bool(config.get("bidirectional", False)),
         )
         model.load_state_dict(torch.load(directory / "weight.pt", weights_only=True))
         return model

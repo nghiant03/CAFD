@@ -7,10 +7,12 @@ fault diagnosis, predicting a fault label at each timestep.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
 
+from CESTA.batch import TemporalWindowBatch
 from CESTA.models.base import BaseModel
 
 
@@ -32,6 +34,8 @@ class GRUClassifier(BaseModel):
         bidirectional: Whether to use bidirectional GRU.
     """
 
+    optional_metadata: ClassVar[set[str]] = {"node_identity"}
+
     def __init__(
         self,
         input_size: int,
@@ -40,6 +44,8 @@ class GRUClassifier(BaseModel):
         num_classes: int = 4,
         dropout: float = 0.2,
         bidirectional: bool = True,
+        num_nodes: int | None = None,
+        node_embedding_dim: int = 0,
     ) -> None:
         super().__init__()
 
@@ -49,9 +55,16 @@ class GRUClassifier(BaseModel):
         self.num_classes = num_classes
         self.dropout_prob = dropout
         self.bidirectional = bidirectional
+        self.num_nodes = num_nodes
+        self.node_embedding_dim = node_embedding_dim
+
+        if node_embedding_dim > 0 and num_nodes is None:
+            raise ValueError("num_nodes is required when node_embedding_dim > 0")
+        self.node_embedding = nn.Embedding(num_nodes, node_embedding_dim) if node_embedding_dim > 0 and num_nodes is not None else None
+        gru_input_size = input_size + node_embedding_dim
 
         self.gru = nn.GRU(
-            input_size=input_size,
+            input_size=gru_input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
@@ -68,7 +81,7 @@ class GRUClassifier(BaseModel):
     def name(self) -> str:
         return "gru"
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor | TemporalWindowBatch) -> torch.Tensor:
         """Forward pass for many-to-many classification.
 
         Args:
@@ -77,6 +90,16 @@ class GRUClassifier(BaseModel):
         Returns:
             Logits tensor of shape (batch, seq_len, num_classes).
         """
+        if isinstance(x, TemporalWindowBatch):
+            node_ids = x.node_ids
+            x = x.x
+        else:
+            node_ids = None
+        if self.node_embedding is not None:
+            if node_ids is None:
+                raise ValueError("node_ids are required when node_embedding_dim > 0")
+            node_embedding = self.node_embedding(node_ids).unsqueeze(1).expand(-1, x.size(1), -1)
+            x = torch.cat([x, node_embedding], dim=-1)
         gru_out, _ = self.gru(x)
         gru_out = self.dropout(gru_out)
         logits = self.fc(gru_out)
@@ -91,6 +114,8 @@ class GRUClassifier(BaseModel):
             "num_classes": self.num_classes,
             "dropout": self.dropout_prob,
             "bidirectional": self.bidirectional,
+            "num_nodes": self.num_nodes,
+            "node_embedding_dim": self.node_embedding_dim,
         }
 
     @classmethod
@@ -114,6 +139,8 @@ class GRUClassifier(BaseModel):
             num_classes=int(config["num_classes"]),
             dropout=float(config["dropout"]),
             bidirectional=bool(config["bidirectional"]),
+            num_nodes=int(config["num_nodes"]) if config.get("num_nodes") is not None else None,
+            node_embedding_dim=int(config.get("node_embedding_dim", 0)),
         )
         model.load_state_dict(
             torch.load(directory / "weight.pt", weights_only=True)

@@ -68,11 +68,14 @@ def train(
     dataset.print_summary()
 
     model_cls = get_model_class(config.model)
+    requested_metadata = set(model_cls.required_metadata)
+    if config.model_kwargs.get("node_embedding_dim", 0):
+        requested_metadata.add("node_identity")
     prepared = dataset.prepare(
         window_config=config.data.window,
         split_config=config.data.split,
         features=config.features,
-        required_metadata=model_cls.required_metadata,
+        required_metadata=requested_metadata,
     )
 
     logger.debug(
