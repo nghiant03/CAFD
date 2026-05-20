@@ -28,6 +28,7 @@ dev = [
     "pandas-stubs>=3.0.0.260204",
     "nbformat>=5.10.4",
     "pydeps>=3.0.2",
+    "pyarrow>=24.0.0",
 ]
 
 [build-system]
