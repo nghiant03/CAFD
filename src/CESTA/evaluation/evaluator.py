@@ -5,173 +5,22 @@ Runs inference on a dataset and computes classification metrics.
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
-
 import numpy as np
 import torch
 import torch.nn as nn
 from numpy.typing import NDArray
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
-from CESTA.batch import GraphWindowBatch, TemporalWindowBatch
-from CESTA.datasets.injected.graph import GraphMetadata
 from CESTA.logging import logger
 from CESTA.models.base import BaseModel
 from CESTA.schema import EvaluateConfig
 from CESTA.schema.fault import FaultType
-from CESTA.training.graph_batch import GraphWindowDataset, TemporalWindowDataset, collate_graph_batch, collate_temporal_batch
+from CESTA.training.batch_utils import infer_num_classes, make_window_loader, prepare_batch
+from CESTA.training.objectives import decode_predictions, masked_loss, valid_outputs
 
 from .communication import aggregate_communication_stats
-from .metrics import ClassMetrics, compute_class_metrics, confusion_matrix, macro_f1
-
-
-@dataclass
-class EvalResult:
-    """Result container returned after evaluation.
-
-    Attributes:
-        loss: Average loss over the evaluation set.
-        accuracy: Overall accuracy.
-        macro_f1: Macro-averaged F1.
-        class_metrics: Per-class precision, recall, F1, and support.
-        y_true: Ground truth labels ``(total_timesteps,)``.
-        y_pred: Predicted labels ``(total_timesteps,)``.
-        y_prob: Predicted class probabilities ``(total_timesteps, num_classes)``.
-    """
-
-    loss: float
-    accuracy: float
-    macro_f1: float
-    class_metrics: ClassMetrics
-    y_true: NDArray[np.int32] = field(
-        default_factory=lambda: np.empty(0, dtype=np.int32)
-    )
-    y_pred: NDArray[np.int32] = field(
-        default_factory=lambda: np.empty(0, dtype=np.int32)
-    )
-    y_prob: NDArray[np.float32] = field(
-        default_factory=lambda: np.empty((0, 0), dtype=np.float32)
-    )
-    communication_metrics: dict[str, Any] | None = None
-
-    def save(
-        self,
-        path: str | Path,
-        train_config: dict[str, Any] | None = None,
-        injection_config: dict[str, Any] | None = None,
-    ) -> None:
-        """Save evaluation results, predictions, and configs to a directory.
-
-        Writes:
-            - ``eval_metrics.json``: aggregate, per-class metrics, and embedded configs.
-            - ``predictions.npz``: integer ``y_true``/``y_pred`` and ``y_prob`` arrays.
-            - ``confusion_matrix.npy``: ``(num_classes, num_classes)`` integer matrix.
-
-        Args:
-            path: Directory to save into (created if needed).
-            train_config: Training config dict to embed.
-            injection_config: Injection config dict to embed.
-        """
-        directory = Path(path)
-        directory.mkdir(parents=True, exist_ok=True)
-
-        names = FaultType.names()
-        per_class = {}
-        for i, name in enumerate(names):
-            if i < len(self.class_metrics.precision):
-                per_class[name] = {
-                    "precision": self.class_metrics.precision[i],
-                    "recall": self.class_metrics.recall[i],
-                    "f1": self.class_metrics.f1[i],
-                    "support": self.class_metrics.support[i],
-                }
-
-        num_classes = len(names)
-        cm = confusion_matrix(self.y_true, self.y_pred, num_classes)
-
-        metrics_dict: dict[str, Any] = {
-            "loss": self.loss,
-            "accuracy": self.accuracy,
-            "macro_f1": self.macro_f1,
-            "per_class": per_class,
-            "class_names": names,
-            "confusion_matrix": cm.tolist(),
-        }
-        if train_config is not None:
-            metrics_dict["train_config"] = train_config
-        if injection_config is not None:
-            metrics_dict["injection_config"] = injection_config
-
-        (directory / "eval_metrics.json").write_text(json.dumps(metrics_dict, indent=2))
-
-        np.savez_compressed(
-            directory / "predictions.npz",
-            y_true=self.y_true.astype(np.int32),
-            y_pred=self.y_pred.astype(np.int32),
-            y_prob=self.y_prob.astype(np.float32),
-        )
-
-        if self.communication_metrics is not None:
-            (directory / "communication_metrics.json").write_text(
-                json.dumps(self.communication_metrics, indent=2)
-            )
-
-    @classmethod
-    def load(cls, path: str | Path) -> EvalResult:
-        """Load evaluation results from a directory.
-
-        Args:
-            path: Directory containing ``eval_metrics.json`` and ``predictions.npz``.
-
-        Returns:
-            Reconstructed EvalResult.
-        """
-        directory = Path(path)
-        meta = json.loads((directory / "eval_metrics.json").read_text())
-
-        per_class = meta.get("per_class", {})
-        names = FaultType.names()
-        precision = [per_class.get(n, {}).get("precision", 0.0) for n in names]
-        recall = [per_class.get(n, {}).get("recall", 0.0) for n in names]
-        f1_scores = [per_class.get(n, {}).get("f1", 0.0) for n in names]
-        support = [per_class.get(n, {}).get("support", 0) for n in names]
-
-        npz_path = directory / "predictions.npz"
-        if npz_path.exists():
-            preds = np.load(npz_path)
-            y_true = preds["y_true"].astype(np.int32)
-            y_pred = preds["y_pred"].astype(np.int32)
-            y_prob = preds["y_prob"].astype(np.float32)
-        else:
-            y_true = np.empty(0, dtype=np.int32)
-            y_pred = np.empty(0, dtype=np.int32)
-            y_prob = np.empty((0, 0), dtype=np.float32)
-
-        communication_path = directory / "communication_metrics.json"
-        communication_metrics = (
-            json.loads(communication_path.read_text())
-            if communication_path.exists()
-            else None
-        )
-
-        return cls(
-            loss=meta["loss"],
-            accuracy=meta["accuracy"],
-            macro_f1=meta["macro_f1"],
-            class_metrics=ClassMetrics(
-                precision=precision,
-                recall=recall,
-                f1=f1_scores,
-                support=support,
-            ),
-            y_true=y_true,
-            y_pred=y_pred,
-            y_prob=y_prob,
-            communication_metrics=communication_metrics,
-        )
+from .metrics import compute_class_metrics, macro_f1
+from .result import EvalResult
 
 
 class Evaluator:
@@ -235,18 +84,18 @@ class Evaluator:
         communication_stats: list[dict[str, float]] = []
 
         for batch in loader:
-            model_input, y_batch, batch_node_mask, batch_size = self._prepare_batch(batch)
+            model_input, y_batch, batch_node_mask, batch_size = prepare_batch(batch, self.device)
 
             logits = model(model_input)
-            loss = self._masked_loss(criterion, logits, y_batch, batch_node_mask)
+            loss = masked_loss(criterion, logits, y_batch, batch_node_mask)
             stats = getattr(model, "last_communication_stats", None)
             if isinstance(stats, dict):
                 communication_stats.append({k: float(v) for k, v in stats.items()})
 
             total_loss += loss.item() * batch_size
-            preds = self._decode_predictions(model, logits, batch_node_mask)
+            preds = decode_predictions(model, logits, batch_node_mask)
             probs = torch.softmax(logits, dim=-1)
-            valid_preds, valid_targets, valid_probs = self._valid_outputs(
+            valid_preds, valid_targets, valid_probs = valid_outputs(
                 preds, y_batch, probs, batch_node_mask
             )
             correct += (valid_preds == valid_targets).sum().item()
@@ -326,27 +175,15 @@ class Evaluator:
         edge_mask: NDArray[np.bool_] | None = None,
     ) -> DataLoader[object]:
         """Create a DataLoader from numpy arrays."""
-        graph_meta = (metadata or {}).get("graph")
-        if isinstance(graph_meta, GraphMetadata) and node_mask is not None and edge_mask is not None:
-            dataset = GraphWindowDataset(X, y, node_mask, edge_mask, graph_meta.edge_index)
-            return DataLoader(
-                dataset,
-                batch_size=self.config.batch_size,
-                shuffle=False,
-                collate_fn=collate_graph_batch,
-            )
-        if isinstance(node_identity := (metadata or {}).get("node_identity"), dict):
-            dataset = TemporalWindowDataset(X, y, node_identity.get("test_node_ids"))
-            return DataLoader(
-                dataset,
-                batch_size=self.config.batch_size,
-                shuffle=False,
-                collate_fn=collate_temporal_batch,
-            )
-        X_t = torch.tensor(X, dtype=torch.float32)
-        y_t = torch.tensor(y, dtype=torch.long)
-        dataset = TensorDataset(X_t, y_t)
-        return DataLoader(dataset, batch_size=self.config.batch_size, shuffle=False)
+        return make_window_loader(
+            X,
+            y,
+            self.config.batch_size,
+            metadata=metadata,
+            node_mask=node_mask,
+            edge_mask=edge_mask,
+            node_identity_split="test",
+        )
 
     def _infer_num_classes(
         self,
@@ -354,91 +191,5 @@ class Evaluator:
         X: NDArray[np.float32],
         metadata: dict[str, object] | None,
     ) -> int:
-        graph_meta = (metadata or {}).get("graph")
-        if isinstance(graph_meta, GraphMetadata) and X.ndim == 4:
-            sample = GraphWindowBatch(
-                x=torch.zeros(1, X.shape[1], X.shape[2], X.shape[3], device=self.device),
-                y=torch.zeros(1, X.shape[1], X.shape[2], dtype=torch.long, device=self.device),
-                node_mask=torch.ones(1, X.shape[1], X.shape[2], dtype=torch.bool, device=self.device),
-                edge_index=torch.tensor(graph_meta.edge_index, dtype=torch.long, device=self.device),
-                edge_mask=torch.ones(1, X.shape[1], graph_meta.edge_index.shape[1], dtype=torch.bool, device=self.device),
-            )
-            return int(model(sample).size(-1))
-        if isinstance((metadata or {}).get("node_identity"), dict):
-            sample = TemporalWindowBatch(
-                x=torch.zeros(1, X.shape[1], X.shape[2], device=self.device),
-                y=torch.zeros(1, X.shape[1], dtype=torch.long, device=self.device),
-                node_ids=torch.zeros(1, dtype=torch.long, device=self.device),
-            )
-            return int(model(sample).size(-1))
-        return int(model(torch.zeros(1, X.shape[1], X.shape[2], device=self.device)).size(-1))
+        return infer_num_classes(model, X, metadata, self.device)
 
-    def _prepare_batch(
-        self,
-        batch: object,
-    ) -> tuple[torch.Tensor | GraphWindowBatch | TemporalWindowBatch, torch.Tensor, torch.Tensor | None, int]:
-        if isinstance(batch, GraphWindowBatch):
-            graph_batch = GraphWindowBatch(
-                x=batch.x.to(self.device),
-                y=batch.y.to(self.device),
-                node_mask=batch.node_mask.to(self.device),
-                edge_index=batch.edge_index.to(self.device),
-                edge_mask=batch.edge_mask.to(self.device),
-            )
-            return graph_batch, graph_batch.y, graph_batch.node_mask, graph_batch.x.size(0)
-        if isinstance(batch, TemporalWindowBatch):
-            temporal_batch = TemporalWindowBatch(
-                x=batch.x.to(self.device),
-                y=batch.y.to(self.device),
-                node_ids=batch.node_ids.to(self.device) if batch.node_ids is not None else None,
-            )
-            return temporal_batch, temporal_batch.y, None, temporal_batch.x.size(0)
-        if not isinstance(batch, (tuple, list)) or len(batch) != 2:
-            raise TypeError("Expected a tensor batch, TemporalWindowBatch, or GraphWindowBatch")
-        X_batch = batch[0].to(self.device)
-        y_batch = batch[1].to(self.device)
-        return X_batch, y_batch, None, X_batch.size(0)
-
-    @staticmethod
-    def _masked_loss(
-        criterion: nn.Module,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-        node_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        flat_logits = logits.reshape(-1, logits.size(-1))
-        flat_targets = targets.reshape(-1)
-        if node_mask is None:
-            return criterion(flat_logits, flat_targets)
-        valid = node_mask.reshape(-1) & (flat_targets >= 0)
-        if not bool(valid.any()):
-            return flat_logits.sum() * 0.0
-        return criterion(flat_logits[valid], flat_targets[valid])
-
-    @staticmethod
-    def _decode_predictions(
-        model: BaseModel,
-        logits: torch.Tensor,
-        node_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        decoder = getattr(model, "crf_decode", None)
-        if callable(decoder) and bool(getattr(model, "use_crf", False)):
-            decoded = decoder(logits, node_mask)
-            if isinstance(decoded, torch.Tensor):
-                return decoded
-        return logits.argmax(dim=-1)
-
-    @staticmethod
-    def _valid_outputs(
-        preds: torch.Tensor,
-        targets: torch.Tensor,
-        probs: torch.Tensor,
-        node_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        flat_preds = preds.reshape(-1)
-        flat_targets = targets.reshape(-1)
-        flat_probs = probs.reshape(-1, probs.size(-1))
-        if node_mask is None:
-            return flat_preds, flat_targets, flat_probs
-        valid = node_mask.reshape(-1) & (flat_targets >= 0)
-        return flat_preds[valid], flat_targets[valid], flat_probs[valid]

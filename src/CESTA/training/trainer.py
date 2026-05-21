@@ -15,22 +15,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from numpy.typing import NDArray
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
-from CESTA.batch import GraphWindowBatch, TemporalWindowBatch
-from CESTA.datasets.injected.graph import GraphMetadata
 from CESTA.evaluation.metrics import ClassMetrics, compute_class_metrics, macro_f1
 from CESTA.logging import logger
 from CESTA.models.base import BaseModel
 from CESTA.schema import TrainConfig
 from CESTA.seed import seed_everything
+from CESTA.training.batch_utils import infer_num_classes, make_window_loader, prepare_batch
 from CESTA.training.callbacks import (
     LoggingCallback,
     TrainingCallback,
     TrainMetrics,
 )
-from CESTA.training.graph_batch import GraphWindowDataset, TemporalWindowDataset, collate_graph_batch, collate_temporal_batch
 from CESTA.training.loss import FocalLoss
+from CESTA.training.objectives import decode_predictions, masked_loss, valid_predictions
 from CESTA.training.oversampling import oversample_minority
 
 
@@ -206,7 +205,7 @@ class Trainer:
 
         model = model.to(self.device)
 
-        num_classes = self._infer_num_classes(model, X_train, metadata)
+        num_classes = infer_num_classes(model, X_train, metadata, self.device)
         logger.info("Using device: {}", self.device)
         criterion = build_loss(self.config, self.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=self.config.learning_rate)
@@ -356,27 +355,16 @@ class Trainer:
         edge_mask: NDArray[np.bool_] | None = None,
     ) -> DataLoader[object]:
         """Create a DataLoader from numpy arrays."""
-        graph_meta = (metadata or {}).get("graph")
-        if isinstance(graph_meta, GraphMetadata) and node_mask is not None and edge_mask is not None:
-            dataset = GraphWindowDataset(X, y, node_mask, edge_mask, graph_meta.edge_index)
-            collate_fn = collate_graph_batch
-        elif isinstance(node_identity := (metadata or {}).get("node_identity"), dict):
-            node_ids = node_identity.get("train_node_ids") if shuffle else node_identity.get("val_node_ids")
-            dataset = TemporalWindowDataset(X, y, node_ids)
-            collate_fn = collate_temporal_batch
-        else:
-            X_t = torch.tensor(X, dtype=torch.float32)
-            y_t = torch.tensor(y, dtype=torch.long)
-            dataset = TensorDataset(X_t, y_t)
-            collate_fn = None
-        generator = torch.Generator()
-        generator.manual_seed(self.config.seed)
-        return DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
+        return make_window_loader(
+            X,
+            y,
+            self.config.batch_size,
             shuffle=shuffle,
-            generator=generator,
-            collate_fn=collate_fn,
+            metadata=metadata,
+            node_mask=node_mask,
+            edge_mask=edge_mask,
+            seed=self.config.seed,
+            node_identity_split="train" if shuffle else "val",
         )
 
     def _infer_num_classes(
@@ -385,24 +373,7 @@ class Trainer:
         X_train: NDArray[np.float32],
         metadata: dict[str, object] | None,
     ) -> int:
-        graph_meta = (metadata or {}).get("graph")
-        if isinstance(graph_meta, GraphMetadata) and X_train.ndim == 4:
-            sample = GraphWindowBatch(
-                x=torch.zeros(1, X_train.shape[1], X_train.shape[2], X_train.shape[3], device=self.device),
-                y=torch.zeros(1, X_train.shape[1], X_train.shape[2], dtype=torch.long, device=self.device),
-                node_mask=torch.ones(1, X_train.shape[1], X_train.shape[2], dtype=torch.bool, device=self.device),
-                edge_index=torch.tensor(graph_meta.edge_index, dtype=torch.long, device=self.device),
-                edge_mask=torch.ones(1, X_train.shape[1], graph_meta.edge_index.shape[1], dtype=torch.bool, device=self.device),
-            )
-            return int(model(sample).size(-1))
-        if isinstance((metadata or {}).get("node_identity"), dict):
-            sample = TemporalWindowBatch(
-                x=torch.zeros(1, X_train.shape[1], X_train.shape[2], device=self.device),
-                y=torch.zeros(1, X_train.shape[1], dtype=torch.long, device=self.device),
-                node_ids=torch.zeros(1, dtype=torch.long, device=self.device),
-            )
-            return int(model(sample).size(-1))
-        return int(model(torch.zeros(1, X_train.shape[1], X_train.shape[2], device=self.device)).size(-1))
+        return infer_num_classes(model, X_train, metadata, self.device)
 
     def _train_epoch(
         self,
@@ -424,12 +395,12 @@ class Trainer:
         all_targets: list[torch.Tensor] = []
 
         for batch in loader:
-            model_input, y_batch, node_mask, batch_size = self._prepare_batch(batch)
+            model_input, y_batch, node_mask, batch_size = prepare_batch(batch, self.device)
 
             optimizer.zero_grad()
             logits = model(model_input)
 
-            loss = self._masked_loss(criterion, logits, y_batch, node_mask)
+            loss = masked_loss(criterion, logits, y_batch, node_mask)
             loss = self._add_auxiliary_loss(model, loss)
             loss = self._add_boundary_loss(model, loss, y_batch, node_mask)
             loss = self._add_crf_loss(model, loss, logits, y_batch, node_mask)
@@ -437,8 +408,8 @@ class Trainer:
             optimizer.step()
 
             total_loss += loss.item() * batch_size
-            preds = self._decode_predictions(model, logits, node_mask)
-            valid_preds, valid_targets = self._valid_predictions(preds, y_batch, node_mask)
+            preds = decode_predictions(model, logits, node_mask)
+            valid_preds, valid_targets = valid_predictions(preds, y_batch, node_mask)
             correct += (valid_preds == valid_targets).sum().item()
             total += valid_targets.numel()
 
@@ -448,61 +419,6 @@ class Trainer:
         avg_loss = total_loss / max(len(loader.dataset), 1)  # type: ignore[arg-type]
         accuracy = correct / max(total, 1)
         return avg_loss, accuracy, (all_preds, all_targets)
-
-    def _prepare_batch(
-        self,
-        batch: object,
-    ) -> tuple[torch.Tensor | GraphWindowBatch | TemporalWindowBatch, torch.Tensor, torch.Tensor | None, int]:
-        if isinstance(batch, GraphWindowBatch):
-            graph_batch = GraphWindowBatch(
-                x=batch.x.to(self.device),
-                y=batch.y.to(self.device),
-                node_mask=batch.node_mask.to(self.device),
-                edge_index=batch.edge_index.to(self.device),
-                edge_mask=batch.edge_mask.to(self.device),
-            )
-            return graph_batch, graph_batch.y, graph_batch.node_mask, graph_batch.x.size(0)
-        if isinstance(batch, TemporalWindowBatch):
-            temporal_batch = TemporalWindowBatch(
-                x=batch.x.to(self.device),
-                y=batch.y.to(self.device),
-                node_ids=batch.node_ids.to(self.device) if batch.node_ids is not None else None,
-            )
-            return temporal_batch, temporal_batch.y, None, temporal_batch.x.size(0)
-        if not isinstance(batch, (tuple, list)) or len(batch) != 2:
-            raise TypeError("Expected a tensor batch, TemporalWindowBatch, or GraphWindowBatch")
-        X_batch = batch[0].to(self.device)
-        y_batch = batch[1].to(self.device)
-        return X_batch, y_batch, None, X_batch.size(0)
-
-    @staticmethod
-    def _masked_loss(
-        criterion: nn.Module,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-        node_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        flat_logits = logits.reshape(-1, logits.size(-1))
-        flat_targets = targets.reshape(-1)
-        if node_mask is None:
-            return criterion(flat_logits, flat_targets)
-        valid = node_mask.reshape(-1) & (flat_targets >= 0)
-        if not bool(valid.any()):
-            return flat_logits.sum() * 0.0
-        return criterion(flat_logits[valid], flat_targets[valid])
-
-    @staticmethod
-    def _valid_predictions(
-        preds: torch.Tensor,
-        targets: torch.Tensor,
-        node_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        flat_preds = preds.reshape(-1)
-        flat_targets = targets.reshape(-1)
-        if node_mask is None:
-            return flat_preds, flat_targets
-        valid = node_mask.reshape(-1) & (flat_targets >= 0)
-        return flat_preds[valid], flat_targets[valid]
 
     def _add_auxiliary_loss(
         self,
@@ -581,19 +497,6 @@ class Trainer:
         return loss + weight * crf_loss
 
     @staticmethod
-    def _decode_predictions(
-        model: BaseModel,
-        logits: torch.Tensor,
-        node_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        decoder = getattr(model, "crf_decode", None)
-        if callable(decoder) and bool(getattr(model, "use_crf", False)):
-            decoded = decoder(logits, node_mask)
-            if isinstance(decoded, torch.Tensor):
-                return decoded
-        return logits.argmax(dim=-1)
-
-    @staticmethod
     def _boundary_targets(
         targets: torch.Tensor,
         node_mask: torch.Tensor | None,
@@ -636,15 +539,15 @@ class Trainer:
         all_targets: list[torch.Tensor] = []
 
         for batch in loader:
-            model_input, y_batch, node_mask, batch_size = self._prepare_batch(batch)
+            model_input, y_batch, node_mask, batch_size = prepare_batch(batch, self.device)
 
             logits = model(model_input)
-            loss = self._masked_loss(criterion, logits, y_batch, node_mask)
+            loss = masked_loss(criterion, logits, y_batch, node_mask)
             loss = self._add_auxiliary_loss(model, loss)
 
             total_loss += loss.item() * batch_size
-            preds = self._decode_predictions(model, logits, node_mask)
-            valid_preds, valid_targets = self._valid_predictions(preds, y_batch, node_mask)
+            preds = decode_predictions(model, logits, node_mask)
+            valid_preds, valid_targets = valid_predictions(preds, y_batch, node_mask)
             correct += (valid_preds == valid_targets).sum().item()
             total += valid_targets.numel()
 
