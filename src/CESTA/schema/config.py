@@ -95,6 +95,11 @@ class TrainConfig(BaseModel):
         target_request_ratio: Target active request ratio for budget_hinge mode.
         gate_entropy_weight: Weight for gate entropy regularization (0 = disabled).
             Positive weight encourages higher gate entropy to prevent collapse to all-zero.
+        boundary_loss_weight: Weight for boundary/change-point auxiliary loss (0 = disabled).
+        boundary_focal_gamma: Focusing parameter for focal BCE boundary loss.
+        boundary_positive_weight: Optional positive-class weight for sparse boundary labels.
+        boundary_dilation: Temporal dilation radius around boundary targets.
+        crf_loss_weight: Weight for optional linear-chain CRF sequence loss (0 = disabled).
         gumbel_tau_start: Initial Gumbel-Softmax temperature.
         gumbel_tau_end: Final Gumbel-Softmax temperature after annealing.
         gumbel_tau_anneal_epochs: Number of epochs over which to linearly anneal
@@ -123,6 +128,11 @@ class TrainConfig(BaseModel):
     communication_penalty_mode: str = Field(default="linear", pattern=r"^(linear|budget_hinge)$")
     target_request_ratio: float = Field(default=0.3, ge=0.0, le=1.0)
     gate_entropy_weight: float = Field(default=0.0, ge=0.0)
+    boundary_loss_weight: float = Field(default=0.0, ge=0.0)
+    boundary_focal_gamma: float = Field(default=2.0, ge=0.0)
+    boundary_positive_weight: float | None = Field(default=None, gt=0.0)
+    boundary_dilation: int = Field(default=0, ge=0)
+    crf_loss_weight: float = Field(default=0.0, ge=0.0)
     gumbel_tau_start: float = Field(default=1.0, gt=0.0)
     gumbel_tau_end: float = Field(default=1.0, gt=0.0)
     gumbel_tau_anneal_epochs: int = Field(default=0, ge=0)

@@ -13,6 +13,7 @@ from typing import Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from numpy.typing import NDArray
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -430,11 +431,13 @@ class Trainer:
 
             loss = self._masked_loss(criterion, logits, y_batch, node_mask)
             loss = self._add_auxiliary_loss(model, loss)
+            loss = self._add_boundary_loss(model, loss, y_batch, node_mask)
+            loss = self._add_crf_loss(model, loss, logits, y_batch, node_mask)
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item() * batch_size
-            preds = logits.argmax(dim=-1)
+            preds = self._decode_predictions(model, logits, node_mask)
             valid_preds, valid_targets = self._valid_predictions(preds, y_batch, node_mask)
             correct += (valid_preds == valid_targets).sum().item()
             total += valid_targets.numel()
@@ -526,6 +529,93 @@ class Trainer:
 
         return loss
 
+    def _add_boundary_loss(
+        self,
+        model: BaseModel,
+        loss: torch.Tensor,
+        targets: torch.Tensor,
+        node_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        weight = self.config.boundary_loss_weight
+        if weight <= 0.0:
+            return loss
+        boundary_logits = getattr(model, "last_boundary_logits", None)
+        if not isinstance(boundary_logits, torch.Tensor):
+            return loss
+        boundary_targets, boundary_mask = self._boundary_targets(targets, node_mask, self.config.boundary_dilation)
+        flat_logits = boundary_logits.reshape(-1)
+        flat_targets = boundary_targets.reshape(-1)
+        flat_mask = boundary_mask.reshape(-1)
+        if not bool(flat_mask.any()):
+            return loss
+        selected_logits = flat_logits[flat_mask]
+        selected_targets = flat_targets[flat_mask]
+        pos_weight = None
+        if self.config.boundary_positive_weight is not None:
+            pos_weight = torch.tensor(self.config.boundary_positive_weight, dtype=selected_logits.dtype, device=selected_logits.device)
+        boundary_loss = F.binary_cross_entropy_with_logits(selected_logits, selected_targets, pos_weight=pos_weight, reduction="none")
+        gamma = self.config.boundary_focal_gamma
+        if gamma > 0.0:
+            probs = torch.sigmoid(selected_logits)
+            p_t = torch.where(selected_targets > 0.5, probs, 1.0 - probs)
+            boundary_loss = ((1.0 - p_t).clamp_min(0.0) ** gamma) * boundary_loss
+        return loss + weight * boundary_loss.mean()
+
+    def _add_crf_loss(
+        self,
+        model: BaseModel,
+        loss: torch.Tensor,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        node_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        weight = self.config.crf_loss_weight
+        if weight <= 0.0:
+            return loss
+        crf_nll = getattr(model, "crf_negative_log_likelihood", None)
+        if not callable(crf_nll):
+            return loss
+        crf_loss = crf_nll(logits, targets, node_mask)
+        if not isinstance(crf_loss, torch.Tensor):
+            return loss
+        return loss + weight * crf_loss
+
+    @staticmethod
+    def _decode_predictions(
+        model: BaseModel,
+        logits: torch.Tensor,
+        node_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        decoder = getattr(model, "crf_decode", None)
+        if callable(decoder) and bool(getattr(model, "use_crf", False)):
+            decoded = decoder(logits, node_mask)
+            if isinstance(decoded, torch.Tensor):
+                return decoded
+        return logits.argmax(dim=-1)
+
+    @staticmethod
+    def _boundary_targets(
+        targets: torch.Tensor,
+        node_mask: torch.Tensor | None,
+        dilation: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = targets >= 0
+        if node_mask is not None:
+            valid = valid & node_mask
+        boundary = torch.zeros_like(targets, dtype=torch.float32)
+        transition_valid = valid[:, 1:] & valid[:, :-1]
+        raw_boundary = ((targets[:, 1:] != targets[:, :-1]) & transition_valid).to(torch.float32)
+        boundary[:, 1:] = raw_boundary
+        boundary_mask = valid.clone()
+        boundary_mask[:, 0] = False
+        if dilation > 0:
+            dilated = boundary.clone()
+            for shift in range(1, dilation + 1):
+                dilated[:, shift:] = torch.maximum(dilated[:, shift:], boundary[:, :-shift])
+                dilated[:, :-shift] = torch.maximum(dilated[:, :-shift], boundary[:, shift:])
+            boundary = dilated * boundary_mask.to(torch.float32)
+        return boundary, boundary_mask
+
     @torch.no_grad()
     def _eval_epoch(
         self,
@@ -553,7 +643,7 @@ class Trainer:
             loss = self._add_auxiliary_loss(model, loss)
 
             total_loss += loss.item() * batch_size
-            preds = logits.argmax(dim=-1)
+            preds = self._decode_predictions(model, logits, node_mask)
             valid_preds, valid_targets = self._valid_predictions(preds, y_batch, node_mask)
             correct += (valid_preds == valid_targets).sum().item()
             total += valid_targets.numel()

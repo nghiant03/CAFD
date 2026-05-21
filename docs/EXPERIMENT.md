@@ -61,6 +61,48 @@ Minimum paper target by fault ratio is approximately:
 
 Preferred Q1-level target is +0.03 to +0.04 average macro-F1 over those best temporal baselines.
 
+## Current Intel_fault15 diagnosis results
+
+All results below use the hard temp-only setting:
+
+```yaml
+features: ["temp"]
+```
+
+The same-split GRU reference for the current `Intel_fault15` diagnosis runs is macro-F1 `0.9018`. The best dense CESTA candidate so far is dense CESTA with logit correction plus a CRF transition layer, at macro-F1 `0.9160`. This clears the minimum +0.01 development target on `fault15` by about `+0.0142` over the same-split GRU, but it is still below the preferred +0.03 to +0.04 Q1-level margin.
+
+| Variant | Run | Val macro-F1 | Test macro-F1 | Δ vs GRU 0.9018 | Δ vs dense logit correction | Notes |
+|---|---|---:|---:|---:|---:|---|
+| Same-split GRU | prior run | — | 0.9018 | — | — | temporal-only reference for current split |
+| Previous dense CESTA | prior run | — | 0.9126 | +0.0108 | -0.0019 | first dense spatial upper-bound candidate |
+| Dense CESTA + logit correction | `runs/cesta/20260520T100015Z_cesta_seed42_a6931bb` | 0.9141 | 0.9145 | +0.0127 | — | best pre-CRF dense candidate |
+| Dense CESTA + logit correction + boundary head | `runs/cesta/20260520T164518Z_cesta_seed42_a6931bb` | 0.9118 | 0.9087 | +0.0069 | -0.0058 | boundary auxiliary head and soft boundary-gated correction hurt DRIFT |
+| Dense CESTA + logit correction + CRF | `runs/cesta/20260520T173159Z_cesta_seed42_a6931bb` | 0.9266 | 0.9160 | +0.0142 | +0.0014 | current best dense upper-bound candidate |
+
+Per-class test F1 for the key dense variants:
+
+| Variant | NORMAL | SPIKE | DRIFT | STUCK | Accuracy | Transmitted bits |
+|---|---:|---:|---:|---:|---:|---:|
+| Dense + logit correction | 0.9831 | 0.9873 | 0.8458 | 0.8419 | 0.9691 | 449560576 |
+| Boundary-aware dense | 0.9819 | 0.9856 | 0.8266 | 0.8407 | 0.9670 | 449560576 |
+| CRF dense | 0.9828 | 0.9748 | 0.8493 | 0.8570 | 0.9691 | 449560576 |
+
+Confusion matrices show the tradeoff: the CRF improves DRIFT and STUCK sequence consistency but smooths some true SPIKE cases. Relative to dense + logit correction, CRF changes the main minority F1s as follows:
+
+```text
+SPIKE: 0.9873 -> 0.9748  (-0.0125)
+DRIFT: 0.8458 -> 0.8493  (+0.0035)
+STUCK: 0.8419 -> 0.8570  (+0.0151)
+```
+
+Current interpretation:
+
+1. Dense CESTA can exceed the same-split temporal baseline under `features: ["temp"]`, but the current margin is modest.
+2. Logit correction is useful and remains part of the dense upper-bound path.
+3. Boundary supervision alone is not a reliable fix: it reduced test macro-F1 and especially DRIFT F1.
+4. A lightweight CRF transition layer is the strongest dense result so far and adds no communication overhead.
+5. Sparse/gated communication experiments should wait until dense CESTA is either tuned further or accepted as a modest upper-bound improvement.
+
 ## Baselines and controls
 
 ### Temporal baselines
@@ -196,6 +238,13 @@ Purpose:
 
 - establish the upper bound for the CESTA architecture without communication limits;
 - provide a stronger spatial baseline than ST-GCN.
+
+Status on `Intel_fault15`:
+
+- dense CESTA + logit correction reached macro-F1 `0.9145`;
+- boundary-aware auxiliary supervision and boundary-gated correction reached only `0.9087`, so this path is deprioritized unless redesigned as full segment-level refinement;
+- dense CESTA + logit correction + CRF reached macro-F1 `0.9160`, making it the current dense upper-bound candidate;
+- all dense variants above have the same transmitted-bit estimate (`449560576`) because boundary and CRF additions are local/decoder-side and do not alter message payloads.
 
 Required outputs:
 
@@ -347,6 +396,35 @@ If negative, reposition the contribution as an energy-aware spatial communicatio
 6. Energy model overstates savings relative to measured ESP32-S3 behavior because radio wake/sleep overhead dominates.
 7. Dense learned message passing beats CESTA by too much, weakening selective-communication claims.
 8. HiFiNet outperforms CESTA without much extra cost.
+9. Structured decoding improves STUCK/DRIFT but oversmooths short SPIKE events.
+10. Boundary auxiliary objectives overemphasize unstable transition regions and hurt plateau classification.
+
+## Diagnosis findings so far
+
+The main `Intel_fault15` error analysis indicates that long fault segments are not the dominant problem. DRIFT has only a small number of test segments longer than the 60-step window and those long segments were classified correctly; STUCK has no test segments longer than the window. Errors concentrate near fault starts and ends, especially the first 10 timesteps after onset.
+
+Observed boundary-region pattern before the boundary-head experiment:
+
+```text
+DRIFT overall accuracy: 0.8354
+DRIFT first 10 steps after start: 0.7367
+DRIFT away from start: 0.9202
+STUCK overall accuracy: 0.7954
+STUCK first 10 steps after start: 0.7510
+STUCK away from start: 0.8918
+```
+
+Tested remedies:
+
+1. **Boundary head + boundary-gated correction**: implemented auxiliary focal BCE supervision on label transitions with dilation and used predicted boundary probability to boost logit correction. Result: macro-F1 dropped from `0.9145` to `0.9087`, mainly from DRIFT F1 dropping `0.8458 -> 0.8266`. Conclusion: naive boundary gating is not sufficient and may destabilize DRIFT decisions.
+2. **CRF transition layer**: added a learned linear-chain transition matrix with masked CRF negative log-likelihood and Viterbi decoding. Result: macro-F1 improved to `0.9160`, with STUCK F1 improving `0.8419 -> 0.8570` and DRIFT F1 improving slightly, but SPIKE F1 dropping `0.9873 -> 0.9748`. Conclusion: structured decoding is promising but must be tuned to avoid oversmoothing short faults.
+
+Promising next dense-upper-bound actions:
+
+1. Tune CRF strength (`crf_loss_weight`) and consider transition initialization from train label transition frequencies.
+2. Protect SPIKE with class-aware transition regularization or lower CRF loss weight.
+3. If revisiting boundaries, use segment-level refinement or boundary-preserving smoothing rather than a simple correction multiplier.
+4. Only proceed to sparse/gated communication claims once dense CESTA's upper bound is stable enough to serve as the proper comparator.
 
 ## Reproducibility notes
 

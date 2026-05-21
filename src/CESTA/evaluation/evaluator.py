@@ -244,7 +244,7 @@ class Evaluator:
                 communication_stats.append({k: float(v) for k, v in stats.items()})
 
             total_loss += loss.item() * batch_size
-            preds = logits.argmax(dim=-1)
+            preds = self._decode_predictions(model, logits, batch_node_mask)
             probs = torch.softmax(logits, dim=-1)
             valid_preds, valid_targets, valid_probs = self._valid_outputs(
                 preds, y_batch, probs, batch_node_mask
@@ -414,6 +414,19 @@ class Evaluator:
         if not bool(valid.any()):
             return flat_logits.sum() * 0.0
         return criterion(flat_logits[valid], flat_targets[valid])
+
+    @staticmethod
+    def _decode_predictions(
+        model: BaseModel,
+        logits: torch.Tensor,
+        node_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        decoder = getattr(model, "crf_decode", None)
+        if callable(decoder) and bool(getattr(model, "use_crf", False)):
+            decoded = decoder(logits, node_mask)
+            if isinstance(decoded, torch.Tensor):
+                return decoded
+        return logits.argmax(dim=-1)
 
     @staticmethod
     def _valid_outputs(

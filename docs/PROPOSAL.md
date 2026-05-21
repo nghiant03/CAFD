@@ -50,7 +50,7 @@ Secondary criteria:
 
 ## Core design
 
-CESTA is a distributed receiver-side request model. Each node first encodes its own local temporal window, estimates local diagnosis uncertainty, and decides which existing graph neighbors to request from and at what compression ratio.
+CESTA is a distributed receiver-side request model. Each node first encodes its own local temporal window, estimates local diagnosis uncertainty, and decides which existing graph neighbors to request from and at what compression ratio. The current dense upper-bound line also includes optional local diagnostic refinements: logit correction and a CRF transition decoder. These refinements do not add message payloads and should be treated as dense-accuracy improvements before selective communication is evaluated.
 
 The graph topology is a fixed directed candidate edge set derived from the existing connectivity data, but runtime communication availability is dynamic. CESTA learns request and compression decisions over currently available candidate edges; it does not perform unconstrained graph discovery in the main method.
 
@@ -247,13 +247,29 @@ Out of scope for the first paper iteration:
 
 ESP32-S3 is a loose target, not a strict hard requirement. The model should aim for the smallest feasible configuration and be defensibly classified as edge-oriented. Quantization and pruning are evaluation tools only, not part of the main algorithmic contribution.
 
+## Current evidence
+
+The current decisive development setting is `Intel_fault15` with `features: ["temp"]`. Dense CESTA has now exceeded the same-split GRU temporal reference, but only modestly:
+
+| Model | Test macro-F1 | Δ vs GRU 0.9018 | Main interpretation |
+|---|---:|---:|---|
+| Same-split GRU | 0.9018 | — | current temporal reference |
+| Dense CESTA + logit correction | 0.9145 | +0.0127 | clears the minimum fault15 target |
+| Dense CESTA + boundary head/gated correction | 0.9087 | +0.0069 | underperforms; naive boundary supervision is risky |
+| Dense CESTA + logit correction + CRF | 0.9160 | +0.0142 | current dense upper-bound candidate |
+
+The CRF variant improves DRIFT/STUCK sequence consistency without changing communication, but it reduces SPIKE F1. This supports the architecture story that CESTA should handle spatial evidence while a lightweight structured decoder can handle temporal label consistency. However, the current gain is far below the preferred +0.03 to +0.04 Q1-level margin, so dense upper-bound tuning remains the priority before communication-efficiency claims.
+
 ## Main risks
 
 1. **Temporal baselines are already strong.** A 3–4 macro-F1 point improvement may require better spatial signal than the current Intel connectivity graph provides.
-2. **ST-GCN is too weak to be decisive.** The paper must include stronger dense and rule-based spatial baselines.
-3. **Gate collapse.** Learned requests may become all-on or all-off without careful penalties and temperature/reward schedules.
-4. **Energy accounting ambiguity.** All communication claims must include TX and RX energy, plus measured edge energy when possible.
-5. **HiFiNet availability.** If HiFiNet is the closest spatial method, it must be reproduced or clearly bounded as unavailable/inapplicable.
+2. **Current dense gains are modest.** The best dense result on `Intel_fault15` is about +0.014 macro-F1 over same-split GRU, enough for the minimum target on this ratio but not yet a strong Q1-level margin.
+3. **ST-GCN is too weak to be decisive.** The paper must include stronger dense and rule-based spatial baselines.
+4. **Gate collapse.** Learned requests may become all-on or all-off without careful penalties and temperature/reward schedules.
+5. **Energy accounting ambiguity.** All communication claims must include TX and RX energy, plus measured edge energy when possible.
+6. **Structured decoding tradeoffs.** CRF-style smoothing helps DRIFT/STUCK but can suppress short SPIKE events unless tuned carefully.
+7. **Boundary modeling fragility.** A boundary auxiliary head and simple boundary-gated correction hurt macro-F1 in the current experiment.
+8. **HiFiNet availability.** If HiFiNet is the closest spatial method, it must be reproduced or clearly bounded as unavailable/inapplicable.
 
 ## Implementation milestones
 
